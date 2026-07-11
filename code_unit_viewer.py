@@ -114,6 +114,8 @@ class UnitIndex:
     def __init__(self, config: ViewerConfig) -> None:
         self.config = config
         self._local = threading.local()
+        self._connections: set[sqlite3.Connection] = set()
+        self._connections_lock = threading.Lock()
 
     def connection(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -121,7 +123,19 @@ class UnitIndex:
             conn = sqlite3.connect(self.config.db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
+            with self._connections_lock:
+                self._connections.add(conn)
         return conn
+
+    def close(self) -> None:
+        """Close every request-thread connection owned by this index."""
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            with contextlib.suppress(sqlite3.Error):
+                conn.close()
+        self._local = threading.local()
 
     def cache_is_current(self) -> bool:
         if not self.config.db_path.exists():
@@ -418,7 +432,7 @@ def json_bytes(payload: Any, status: HTTPStatus = HTTPStatus.OK) -> tuple[int, b
     return status.value, body, "application/json; charset=utf-8"
 
 
-def make_handler(index: UnitIndex) -> type[BaseHTTPRequestHandler]:
+def make_handler(context: Any) -> type[BaseHTTPRequestHandler]:
     class ViewerHandler(BaseHTTPRequestHandler):
         server_version = "CodeUnitViewer/1.0"
 
@@ -431,6 +445,40 @@ def make_handler(index: UnitIndex) -> type[BaseHTTPRequestHandler]:
             try:
                 if parsed.path == "/":
                     self._send(HTTPStatus.OK.value, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                    return
+                if parsed.path == "/api/app":
+                    if hasattr(context, "app_payload"):
+                        self._send_tuple(json_bytes(context.app_payload()))
+                    else:
+                        metadata = context.metadata()
+                        self._send_tuple(
+                            json_bytes(
+                                {
+                                    "status": "ready",
+                                    "project": {
+                                        "name": Path(context.config.source_root).name,
+                                        "path": str(context.config.source_root),
+                                    },
+                                    "has_record": True,
+                                    "summary": metadata.get("summary", {}),
+                                    "progress": None,
+                                    "error": None,
+                                    "dynamic": False,
+                                }
+                            )
+                        )
+                    return
+                index = self._ready_index()
+                if index is None:
+                    self._send_tuple(
+                        json_bytes(
+                            {
+                                "error": "project_not_ready",
+                                "message": "분석할 프로젝트를 먼저 선택하세요.",
+                            },
+                            HTTPStatus.CONFLICT,
+                        )
+                    )
                     return
                 if parsed.path == "/api/meta":
                     self._send_tuple(json_bytes(index.metadata()))
@@ -470,6 +518,63 @@ def make_handler(index: UnitIndex) -> type[BaseHTTPRequestHandler]:
                         HTTPStatus.INTERNAL_SERVER_ERROR,
                     )
                 )
+
+        def do_POST(self) -> None:  # noqa: N802
+            parsed = urllib.parse.urlparse(self.path)
+            if not hasattr(context, "select_project"):
+                self._send_tuple(json_bytes({"error": "not found"}, HTTPStatus.NOT_FOUND))
+                return
+            try:
+                if parsed.path == "/api/project/pick":
+                    self._send_tuple(json_bytes(context.pick_project()))
+                    return
+                payload = self._read_json_body()
+                if parsed.path == "/api/project/select":
+                    path = payload.get("path")
+                    if not isinstance(path, str) or not path.strip():
+                        self._send_tuple(
+                            json_bytes({"error": "path_required", "message": "프로젝트 경로가 필요합니다."}, HTTPStatus.BAD_REQUEST)
+                        )
+                        return
+                    result = context.select_project(path)
+                    self._send_tuple(json_bytes(result, HTTPStatus.ACCEPTED))
+                    return
+                if parsed.path == "/api/project/analyze":
+                    result = context.start_analysis(force=bool(payload.get("force", False)))
+                    self._send_tuple(json_bytes(result, HTTPStatus.ACCEPTED))
+                    return
+                self._send_tuple(json_bytes({"error": "not found"}, HTTPStatus.NOT_FOUND))
+            except RuntimeError as exc:
+                self._send_tuple(
+                    json_bytes({"error": "conflict", "message": str(exc)}, HTTPStatus.CONFLICT)
+                )
+            except (OSError, ValueError) as exc:
+                self._send_tuple(
+                    json_bytes({"error": "invalid_request", "message": str(exc)}, HTTPStatus.BAD_REQUEST)
+                )
+            except Exception as exc:  # pragma: no cover - runtime guard
+                self._send_tuple(
+                    json_bytes({"error": type(exc).__name__, "message": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                )
+
+        def _ready_index(self) -> UnitIndex | None:
+            if hasattr(context, "current_index"):
+                return context.current_index()
+            return context
+
+        def _read_json_body(self) -> dict[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise ValueError("Invalid Content-Length") from exc
+            if length > 1024 * 1024:
+                raise ValueError("Request body is too large")
+            if length == 0:
+                return {}
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            return payload
 
         def _send_tuple(self, response: tuple[int, bytes, str]) -> None:
             self._send(*response)
@@ -572,6 +677,7 @@ def serve_viewer(
         print("\n[viewer] stopped", flush=True)
     finally:
         server.server_close()
+        index.close()
     return 0
 
 
@@ -601,6 +707,21 @@ INDEX_HTML = r'''<main id="app">
     <label class="check"><input id="warningOnly" type="checkbox"> 경고 파일만</label>
     <label class="check"><input id="errorOnly" type="checkbox"> 파싱 오류만</label>
   </header>
+
+  <section id="projectBar" class="project-bar hidden">
+    <label class="project-path-label">
+      <span>프로젝트</span>
+      <input id="projectPath" type="text" placeholder="D:\project\example" autocomplete="off">
+    </label>
+    <button id="pickProject" type="button">폴더 선택</button>
+    <button id="applyProject" type="button">경로 적용</button>
+    <button id="analyzeProject" type="button" class="hidden">분석 시작</button>
+    <button id="reanalyzeProject" type="button" class="hidden">새로 분석</button>
+    <div class="project-state">
+      <strong id="projectStatus">프로젝트를 선택하세요.</strong>
+      <span id="projectProgress"></span>
+    </div>
+  </section>
 
   <section class="workspace">
     <aside class="sidebar">
@@ -684,7 +805,7 @@ INDEX_HTML = r'''<main id="app">
   body { margin: 0; background: var(--bg); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, sans-serif; overflow: hidden; }
   button, input { font: inherit; }
   button { color: inherit; }
-  #app { height: 100vh; display: grid; grid-template-rows: 48px minmax(0, 1fr); }
+  #app { height: 100vh; display: grid; grid-template-rows: 48px auto minmax(0, 1fr); }
   .topbar { display: flex; align-items: center; gap: 16px; padding: 0 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
   .brand { font-weight: 700; white-space: nowrap; }
   .metrics { display: flex; gap: 8px; flex: 1; min-width: 0; }
@@ -693,6 +814,16 @@ INDEX_HTML = r'''<main id="app">
   input[type="search"] { width: 220px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; outline: none; }
   input[type="search"]:focus { border-color: var(--accent); }
   .check { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .project-bar { min-height: 58px; display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+  .project-path-label { display: flex; align-items: center; gap: 8px; min-width: 280px; flex: 1; color: var(--muted); font-size: 12px; }
+  .project-path-label input { min-width: 180px; flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 7px 9px; outline: none; }
+  .project-path-label input:focus { border-color: var(--accent); }
+  .project-bar button { min-height: 32px; border: 1px solid var(--border); background: var(--panel); padding: 5px 10px; cursor: pointer; }
+  .project-bar button:hover:not(:disabled) { border-color: var(--accent); }
+  .project-bar button:disabled { opacity: .45; cursor: default; }
+  .project-state { min-width: 240px; max-width: 400px; display: grid; gap: 3px; font-size: 12px; }
+  .project-state strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-state span { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .workspace { min-height: 0; display: grid; grid-template-columns: 280px minmax(440px, 1fr) 340px; }
   .sidebar, .inspector { min-width: 0; background: var(--panel); overflow: auto; }
   .sidebar { border-right: 1px solid var(--border); }
@@ -745,6 +876,8 @@ INDEX_HTML = r'''<main id="app">
   .badge { display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 999px; padding: 2px 7px; color: var(--muted); font-size: 11px; }
   .warning-dot { color: var(--warning); }
   .empty { padding: 18px 14px; color: var(--muted); font-size: 13px; }
+  .project-empty { height: 100%; min-width: 520px; display: grid; place-content: center; gap: 10px; text-align: center; color: var(--muted); }
+  .project-empty strong { color: var(--text); font-size: 16px; }
   #unitInspector { padding: 12px; }
   .inspector-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
   .inspector-head strong { font: 12px ui-monospace, monospace; overflow-wrap: anywhere; }
@@ -763,6 +896,7 @@ INDEX_HTML = r'''<main id="app">
     .workspace { grid-template-columns: 240px minmax(420px, 1fr); }
     .inspector { display: none; }
     .metrics, .check { display: none; }
+    .project-state { display: none; }
   }
 </style>
 
@@ -786,6 +920,10 @@ INDEX_HTML = r'''<main id="app">
     filteredMarkers: [],
     unitRowHeight: 42,
     unitRenderQueued: false,
+    collapsedFolders: new Set(),
+    app: null,
+    readyKey: null,
+    loadingData: false,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -796,8 +934,8 @@ INDEX_HTML = r'''<main id="app">
   const unitList = $('unitList');
   const unitListCanvas = $('unitListCanvas');
 
-  async function api(path) {
-    const response = await fetch(path);
+  async function api(path, options = {}) {
+    const response = await fetch(path, options);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.message || payload.error || response.statusText);
     return payload;
@@ -813,7 +951,9 @@ INDEX_HTML = r'''<main id="app">
     return new Intl.NumberFormat('ko-KR').format(value || 0);
   }
 
-  async function init() {
+  async function loadReadyProject(readyKey) {
+    if (state.loadingData || state.readyKey === readyKey) return;
+    state.loadingData = true;
     try {
       const [meta, filePayload] = await Promise.all([api('/api/meta'), api('/api/files')]);
       state.meta = meta;
@@ -827,11 +967,142 @@ INDEX_HTML = r'''<main id="app">
       ].map(([label, value]) => `<span class="metric">${label}: ${formatNumber(value)}</span>`).join('');
       applyFileFilter();
       const first = state.filteredFiles[0];
-      if (first) selectFile(first.file);
+      if (first) await selectFile(first.file);
+      state.readyKey = readyKey;
+    } catch (error) {
+      $('notice').textContent = error.message;
+      $('notice').classList.remove('hidden');
+    } finally {
+      state.loadingData = false;
+    }
+  }
+
+  function resetProjectView(clearFolders = true) {
+    state.meta = null;
+    state.files = [];
+    state.filteredFiles = [];
+    state.activeFile = null;
+    state.fileData = null;
+    state.sourceLines = [];
+    state.markers = [];
+    state.markerById = new Map();
+    state.starts = new Map();
+    state.ends = new Map();
+    state.selectedUnitId = null;
+    state.selectedRange = null;
+    state.readyKey = null;
+    if (clearFolders) state.collapsedFolders.clear();
+    $('fileSearch').value = '';
+    $('warningOnly').checked = false;
+    $('errorOnly').checked = false;
+    $('activeFile').textContent = '파일을 선택하세요';
+    $('fileMeta').textContent = '';
+    $('visibleFileCount').textContent = '';
+    metrics.innerHTML = '';
+    tree.innerHTML = '';
+    unitListCanvas.innerHTML = '';
+  }
+
+  function showProjectEmpty(title, detail = '') {
+    codeCanvas.style.height = '100%';
+    codeCanvas.innerHTML = `<div class="project-empty"><strong>${esc(title)}</strong><span>${esc(detail)}</span></div>`;
+  }
+
+  async function pollApp() {
+    try {
+      const app = await api('/api/app');
+      const previousPath = state.app?.project?.path || null;
+      const nextPath = app.project?.path || null;
+      if (previousPath !== nextPath) resetProjectView(true);
+      state.app = app;
+      renderAppState(app);
+      if (app.status === 'ready') {
+        const readyKey = `${nextPath}|${app.record_version || 'fixed'}`;
+        await loadReadyProject(readyKey);
+      }
     } catch (error) {
       $('notice').textContent = error.message;
       $('notice').classList.remove('hidden');
     }
+  }
+
+  function renderAppState(app) {
+    const dynamic = app.dynamic !== false;
+    $('projectBar').classList.toggle('hidden', !dynamic);
+    if (!dynamic) return;
+    if (app.project?.path && document.activeElement !== $('projectPath')) {
+      $('projectPath').value = app.project.path;
+    }
+    const busy = app.status === 'loading' || app.status === 'analyzing';
+    $('projectPath').disabled = busy;
+    $('pickProject').disabled = busy;
+    $('applyProject').disabled = busy;
+    $('analyzeProject').disabled = busy;
+    $('reanalyzeProject').disabled = busy;
+    $('analyzeProject').classList.toggle('hidden', app.status !== 'project_selected' && !(app.status === 'error' && app.project));
+    $('reanalyzeProject').classList.toggle('hidden', app.status !== 'ready');
+
+    const summary = app.summary || {};
+    const labels = {
+      empty: '프로젝트를 선택하세요.',
+      loading: '기존 분석 기록을 확인하고 있습니다.',
+      project_selected: '이 프로젝트의 분석 기록이 없습니다.',
+      analyzing: '프로젝트 분석 중',
+      ready: app.project?.name || '프로젝트 준비 완료',
+      error: '작업을 완료하지 못했습니다.',
+    };
+    $('projectStatus').textContent = labels[app.status] || app.status;
+    if (app.status === 'ready') {
+      const summaryText = `파일 ${formatNumber(summary.file_count)}개 · 코드 단위 ${formatNumber(summary.unit_count)}개 · 경고 ${formatNumber(summary.warning_count)}개 · 파싱 오류 ${formatNumber(summary.parse_error_file_count)}개`;
+      $('projectProgress').textContent = app.error ? `${app.error} · ${summaryText}` : summaryText;
+    } else if (app.status === 'analyzing') {
+      const progress = app.progress || {};
+      $('projectProgress').textContent = `${formatNumber(progress.current)} / ${formatNumber(progress.total)} 파일 · ${progress.file || '준비 중'}`;
+      showProjectEmpty('프로젝트 분석 중', `${formatNumber(progress.current)} / ${formatNumber(progress.total)} 파일 · ${progress.file || ''}`);
+    } else if (app.status === 'loading') {
+      $('projectProgress').textContent = app.project?.path || '';
+      showProjectEmpty('분석 기록을 준비하고 있습니다.', app.project?.path || '');
+    } else if (app.status === 'project_selected') {
+      $('projectProgress').textContent = app.project?.path || '';
+      showProjectEmpty('이 프로젝트의 분석 기록이 없습니다.', '상단의 분석 시작 버튼을 누르세요.');
+    } else if (app.status === 'error') {
+      $('projectProgress').textContent = app.error || '';
+      showProjectEmpty('작업을 완료하지 못했습니다.', app.error || '');
+    } else {
+      $('projectProgress').textContent = '';
+      showProjectEmpty('분석할 프로젝트를 선택하세요.', '상단에 경로를 입력하거나 폴더 선택 버튼을 누르세요.');
+    }
+  }
+
+  async function postJson(path, payload = {}) {
+    return api(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async function applyProjectPath(path = $('projectPath').value.trim()) {
+    if (!path) return;
+    await postJson('/api/project/select', { path });
+    await pollApp();
+  }
+
+  async function pickProject() {
+    const result = await postJson('/api/project/pick');
+    if (result.cancelled) return;
+    $('projectPath').value = result.path;
+    await applyProjectPath(result.path);
+  }
+
+  async function analyzeProject(force) {
+    await postJson('/api/project/analyze', { force });
+    await pollApp();
+  }
+
+  async function init() {
+    await pollApp();
+    window.setInterval(pollApp, 500);
   }
 
   function applyFileFilter() {
@@ -865,30 +1136,36 @@ INDEX_HTML = r'''<main id="app">
   function renderTree() {
     const model = buildTree(state.filteredFiles);
     tree.innerHTML = '';
-    tree.appendChild(renderTreeNode(model, 0, true));
+    tree.appendChild(renderTreeNode(model, 0));
   }
 
-  function renderTreeNode(node, depth, isRoot = false) {
+  function renderTreeNode(node, depth, parentPath = '') {
     const fragment = document.createDocumentFragment();
     for (const folder of [...node.folders.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+      const folderPath = parentPath ? `${parentPath}/${folder.name}` : folder.name;
       const wrap = document.createElement('div');
       wrap.className = 'tree-node';
+      wrap.dataset.folderPath = folderPath;
       const row = document.createElement('div');
       row.className = 'folder-row';
       row.style.paddingLeft = `${8 + depth * 14}px`;
       const chev = document.createElement('span');
       chev.className = 'chevron';
-      chev.textContent = '▾';
+      const isCollapsed = state.collapsedFolders.has(folderPath);
+      chev.textContent = isCollapsed ? '▸' : '▾';
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'folder-toggle';
       button.textContent = folder.name;
       const children = document.createElement('div');
-      children.className = 'folder-children';
-      children.appendChild(renderTreeNode(folder, depth + 1));
+      children.className = 'folder-children' + (isCollapsed ? ' collapsed' : '');
+      children.appendChild(renderTreeNode(folder, depth + 1, folderPath));
       const toggle = () => {
         children.classList.toggle('collapsed');
-        chev.textContent = children.classList.contains('collapsed') ? '▸' : '▾';
+        const collapsed = children.classList.contains('collapsed');
+        chev.textContent = collapsed ? '▸' : '▾';
+        if (collapsed) state.collapsedFolders.add(folderPath);
+        else state.collapsedFolders.delete(folderPath);
       };
       row.addEventListener('click', toggle);
       row.append(chev, button);
@@ -922,11 +1199,11 @@ INDEX_HTML = r'''<main id="app">
     state.activeFile = filePath;
     state.selectedUnitId = null;
     state.selectedRange = null;
-    renderTree();
+    updateActiveFileRow(filePath);
     $('activeFile').textContent = filePath;
     $('fileMeta').textContent = ' 불러오는 중...';
     codeCanvas.innerHTML = '';
-    unitList.innerHTML = '';
+    unitListCanvas.innerHTML = '';
     try {
       const data = await api(`/api/file?path=${encodeURIComponent(filePath)}`);
       state.fileData = data;
@@ -956,6 +1233,16 @@ INDEX_HTML = r'''<main id="app">
     } catch (error) {
       $('notice').textContent = error.message;
       $('notice').classList.remove('hidden');
+    }
+  }
+
+  function updateActiveFileRow(filePath) {
+    tree.querySelector('.file-row.active')?.classList.remove('active');
+    for (const row of tree.querySelectorAll('.file-row')) {
+      if (row.dataset.path === filePath) {
+        row.classList.add('active');
+        break;
+      }
     }
   }
 
@@ -1209,11 +1496,27 @@ source ${marker.start_line}-${marker.end_line}`;
   $('warningOnly').addEventListener('change', applyFileFilter);
   $('errorOnly').addEventListener('change', applyFileFilter);
   $('unitSearch').addEventListener('input', renderUnitList);
+  $('pickProject').addEventListener('click', () => pickProject().catch(showActionError));
+  $('applyProject').addEventListener('click', () => applyProjectPath().catch(showActionError));
+  $('analyzeProject').addEventListener('click', () => analyzeProject(false).catch(showActionError));
+  $('reanalyzeProject').addEventListener('click', () => {
+    if (window.confirm('기존 분석 기록을 교체하고 처음부터 다시 분석하시겠습니까?')) {
+      analyzeProject(true).catch(showActionError);
+    }
+  });
+  $('projectPath').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') applyProjectPath().catch(showActionError);
+  });
   $('sourceTab').addEventListener('click', () => switchTab('source'));
   $('unitsTab').addEventListener('click', () => switchTab('units'));
   codeViewport.addEventListener('scroll', queueLineRender);
   unitList.addEventListener('scroll', queueUnitRender);
   window.addEventListener('resize', queueLineRender);
+
+  function showActionError(error) {
+    $('notice').textContent = error.message;
+    $('notice').classList.remove('hidden');
+  }
 
   init();
 })();

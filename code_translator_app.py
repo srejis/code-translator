@@ -9,10 +9,13 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
-import traceback
+import time
+import webbrowser
 from dataclasses import dataclass
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -170,6 +173,7 @@ def refresh_analysis_record(
     output_root: Path = PROJECTS_OUTPUT_ROOT,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     analyzer: Callable[..., dict[str, object]] = analyze_repository,
+    before_replace: Callable[[], None] | None = None,
 ) -> AnalysisRecord:
     project_root = project_root.resolve()
     destination = project_json_path(project_root, output_root=output_root)
@@ -188,6 +192,8 @@ def refresh_analysis_record(
         record = validate_record(temporary, project_root)
         if record is None:
             raise ValueError("The generated analysis JSON failed validation.")
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, destination)
         remove_viewer_indexes(destination)
     finally:
@@ -227,178 +233,302 @@ def summary_text(record: AnalysisRecord | None, *, damaged: bool = False) -> str
     return "기존 분석 기록이 있습니다.\n" + " · ".join(parts)
 
 
-def run_project(
-    project_root: Path,
-    *,
-    force: bool = False,
-    open_browser: bool = True,
-) -> int:
-    project_root = validate_project(project_root)
-    record = None if force else find_analysis_record(project_root)
-    if record is None:
-        record = refresh_analysis_record(project_root)
-    return serve_viewer(
-        record.path,
-        source_root=project_root,
-        open_browser=open_browser,
-    )
+def native_directory_chooser() -> str | None:
+    """Open only the operating system's folder picker, with no launcher window."""
+    if os.name == "nt":
+        script = (
+            "$folder=(New-Object -ComObject Shell.Application).BrowseForFolder("
+            "0,'분석할 프로젝트 폴더를 선택하세요.',0,0);"
+            "if($folder){[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+            "$folder.Self.Path}"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        selected = result.stdout.strip()
+        return selected or None
+
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        selected = filedialog.askdirectory(mustexist=True)
+        return selected or None
+    finally:
+        root.destroy()
 
 
-class LauncherWindow:
-    def __init__(self, tk: Any, filedialog: Any, messagebox: Any) -> None:
-        self.tk = tk
-        self.filedialog = filedialog
-        self.messagebox = messagebox
-        self.root = tk.Tk()
-        self.root.title("Code Translator")
-        self.root.geometry("720x300")
-        self.root.minsize(620, 280)
-        self.project: Path | None = None
+def choose_project_directory(
+    chooser: Callable[[], str | None] = native_directory_chooser,
+) -> str | None:
+    return chooser()
+
+
+class ViewerApplicationState:
+    def __init__(
+        self,
+        *,
+        output_root: Path = PROJECTS_OUTPUT_ROOT,
+        legacy_root: Path | None = None,
+        chooser: Callable[[], str | None] = native_directory_chooser,
+        analyzer: Callable[..., dict[str, object]] = analyze_repository,
+    ) -> None:
+        self.lock = threading.RLock()
+        self.status = "empty"
+        self.project_root: Path | None = None
         self.record: AnalysisRecord | None = None
-        self.viewer_request: tuple[Path, Path] | None = None
+        self.index: Any | None = None
+        self.progress: dict[str, object] | None = None
+        self.error: str | None = None
+        self.analysis_thread: threading.Thread | None = None
+        self.output_root = output_root
+        self.legacy_root = legacy_root
+        self.chooser = chooser
+        self.analyzer = analyzer
+        self._generation = 0
 
-        frame = tk.Frame(self.root, padx=18, pady=18)
-        frame.pack(fill="both", expand=True)
-        tk.Label(frame, text="분석할 프로젝트", anchor="w").pack(fill="x")
-        path_row = tk.Frame(frame)
-        path_row.pack(fill="x", pady=(6, 12))
-        self.path_var = tk.StringVar()
-        tk.Entry(path_row, textvariable=self.path_var, state="readonly").pack(
-            side="left", fill="x", expand=True
-        )
-        tk.Button(path_row, text="폴더 선택", command=self.choose_folder).pack(
-            side="left", padx=(8, 0)
-        )
-        self.status_var = tk.StringVar(value="프로젝트 폴더를 선택하세요.")
-        tk.Label(frame, textvariable=self.status_var, justify="left", anchor="w").pack(
-            fill="x", pady=(0, 12)
-        )
-        button_row = tk.Frame(frame)
-        button_row.pack(fill="x")
-        self.open_button = tk.Button(
-            button_row, text="분석 후 열기", state="disabled", command=self.open_project
-        )
-        self.open_button.pack(side="left")
-        self.force_button = tk.Button(
-            button_row,
-            text="기록 삭제 후 새로 분석",
-            state="disabled",
-            command=self.confirm_force,
-        )
-        self.force_button.pack(side="left", padx=(8, 0))
-        self.progress_var = tk.StringVar()
-        tk.Label(
-            frame,
-            textvariable=self.progress_var,
-            justify="left",
-            anchor="w",
-            fg="#555555",
-            wraplength=660,
-        ).pack(fill="x", pady=(18, 0))
-        self.root.after(100, self._initial_folder_prompt)
+    def app_payload(self) -> dict[str, object]:
+        with self.lock:
+            project = self.project_root
+            record = self.record
+            return {
+                "status": self.status,
+                "project": (
+                    {"name": project.name, "path": str(project)} if project else None
+                ),
+                "has_record": record is not None,
+                "summary": dict(record.summary) if record else None,
+                "record_version": (
+                    f"{record.path}:{record.path.stat().st_mtime_ns}" if record else None
+                ),
+                "progress": dict(self.progress) if self.progress else None,
+                "error": self.error,
+                "dynamic": True,
+            }
 
-    def _initial_folder_prompt(self) -> None:
-        if not self.choose_folder():
-            self.root.destroy()
+    def current_index(self) -> Any | None:
+        with self.lock:
+            return self.index if self.status == "ready" else None
 
-    def choose_folder(self) -> bool:
-        selected = self.filedialog.askdirectory(mustexist=True)
-        if not selected:
-            return False
+    def pick_project(self) -> dict[str, object]:
+        selected = choose_project_directory(self.chooser)
+        return {"cancelled": selected is None, "path": selected}
+
+    def select_project(
+        self,
+        path: str | Path,
+        *,
+        auto_analyze: bool = False,
+        force: bool = False,
+    ) -> dict[str, object]:
+        project = validate_project(Path(path))
+        with self.lock:
+            if self.status == "analyzing":
+                raise RuntimeError("프로젝트 분석이 진행 중입니다.")
+            old_index = self.index
+            self._generation += 1
+            generation = self._generation
+            self.status = "loading"
+            self.project_root = project
+            self.record = None
+            self.index = None
+            self.progress = None
+            self.error = None
+        if old_index is not None:
+            old_index.close()
+
+        thread = threading.Thread(
+            target=self._load_project,
+            args=(project, generation, auto_analyze, force),
+            name="project-load",
+            daemon=True,
+        )
+        with self.lock:
+            self.analysis_thread = thread
+        thread.start()
+        return {"status": "loading", "path": str(project)}
+
+    def _load_project(
+        self, project: Path, generation: int, auto_analyze: bool, force: bool
+    ) -> None:
         try:
-            self.project = validate_project(Path(selected))
-            cache_path = project_json_path(self.project)
-            damaged = cache_path.exists() and validate_record(cache_path, self.project) is None
-            self.record = find_analysis_record(self.project)
+            record = None if force else find_analysis_record(
+                project, output_root=self.output_root, legacy_root=self.legacy_root
+            )
+            if record is not None:
+                self._install_record(project, record, generation)
+                return
+            if auto_analyze:
+                with self.lock:
+                    if generation != self._generation:
+                        return
+                    self.status = "analyzing"
+                self._analyze(project, generation)
+                return
+            with self.lock:
+                if generation == self._generation:
+                    self.status = "project_selected"
+                    self.analysis_thread = None
         except Exception as exc:
-            self._show_error(exc)
-            return False
-        self.path_var.set(str(self.project))
-        self.status_var.set(summary_text(self.record, damaged=damaged))
-        self.open_button.configure(
-            text="기존 기록 열기" if self.record else "분석 후 열기", state="normal"
-        )
-        self.force_button.configure(state="normal")
-        self.progress_var.set("")
-        return True
+            self._set_error(exc, generation)
 
-    def open_project(self) -> None:
-        if self.project is None:
-            return
-        if self.record is not None:
-            self._launch_viewer(self.record)
-        else:
-            self._start_analysis()
+    def start_analysis(self, *, force: bool = False) -> dict[str, object]:
+        with self.lock:
+            if self.status in {"loading", "analyzing"}:
+                raise RuntimeError("프로젝트 작업이 이미 진행 중입니다.")
+            if self.project_root is None:
+                raise ValueError("분석할 프로젝트를 먼저 선택하세요.")
+            if not force and self.record is not None and self.status == "ready":
+                return {"status": "ready", "message": "기존 분석 기록을 사용 중입니다."}
+            project = self.project_root
+            generation = self._generation
+            self.status = "analyzing"
+            self.progress = {"phase": "starting", "current": 0, "total": 0, "file": ""}
+            self.error = None
+            thread = threading.Thread(
+                target=self._analyze,
+                args=(project, generation),
+                name="code-analysis",
+                daemon=True,
+            )
+            self.analysis_thread = thread
+            thread.start()
+        return {"status": "analyzing"}
 
-    def confirm_force(self) -> None:
-        if self.project is None:
-            return
-        confirmed = self.messagebox.askyesno(
-            "새로 분석",
-            "기존 분석 기록을 무시하고 프로젝트를 처음부터 다시 분석합니다.\n계속하시겠습니까?",
-        )
-        if confirmed:
-            self._start_analysis()
-
-    def _start_analysis(self) -> None:
-        assert self.project is not None
-        self.open_button.configure(state="disabled")
-        self.force_button.configure(state="disabled")
-        self.progress_var.set("분석을 준비하고 있습니다...")
-        project = self.project
+    def _analyze(self, project: Path, generation: int) -> None:
+        with self.lock:
+            previous_record = self.record
+            previous_index = self.index
+        previous_index_closed = False
 
         def progress(event: dict[str, object]) -> None:
-            self.root.after(0, self._update_progress, event)
+            with self.lock:
+                if generation == self._generation:
+                    self.progress = dict(event)
 
-        def worker() -> None:
-            try:
-                record = refresh_analysis_record(project, progress_callback=progress)
-            except Exception as exc:
-                traceback.print_exc()
-                self.root.after(0, self._analysis_failed, exc)
-            else:
-                self.root.after(0, self._launch_viewer, record)
+        def close_previous_index() -> None:
+            nonlocal previous_index_closed
+            if previous_index is not None:
+                previous_index.close()
+                previous_index_closed = True
 
-        threading.Thread(target=worker, name="code-analysis", daemon=True).start()
-
-    def _update_progress(self, event: dict[str, object]) -> None:
-        current = int(event.get("current", 0))
-        total = int(event.get("total", 0))
-        file_name = str(event.get("file", ""))
-        self.progress_var.set(f"분석 중 {current:,}/{total:,}\n{file_name}")
-
-    def _analysis_failed(self, exc: Exception) -> None:
-        self.open_button.configure(state="normal")
-        self.force_button.configure(state="normal")
-        self.progress_var.set("분석에 실패했습니다. 기존 정상 기록은 유지됩니다.")
-        self._show_error(exc)
-
-    def _launch_viewer(self, record: AnalysisRecord) -> None:
-        assert self.project is not None
-        self.viewer_request = (record.path, self.project)
-        self.root.destroy()
-
-    def _show_error(self, exc: Exception) -> None:
-        print(f"[launcher] {type(exc).__name__}: {exc}", file=sys.stderr)
-        self.messagebox.showerror(
-            "Code Translator 오류",
-            f"{exc}\n\n의존 패키지와 폴더 권한을 확인한 뒤 다시 시도하세요.",
-        )
-
-    def run(self) -> int:
-        self.root.mainloop()
-        if self.viewer_request is None:
-            return 0
-        json_path, project_root = self.viewer_request
         try:
-            return serve_viewer(json_path, source_root=project_root, open_browser=True)
-        except Exception as exc:
-            traceback.print_exc()
-            self.messagebox.showerror(
-                "Code Translator 오류",
-                f"뷰어를 시작하지 못했습니다.\n{exc}\n\nSQLite 파일과 로컬 포트를 확인하세요.",
+            record = refresh_analysis_record(
+                project,
+                output_root=self.output_root,
+                progress_callback=progress,
+                analyzer=self.analyzer,
+                before_replace=close_previous_index,
             )
-            return 1
+            self._install_record(project, record, generation)
+        except Exception as exc:
+            print(f"[analysis] {type(exc).__name__}: {exc}", file=sys.stderr)
+            if previous_record is not None:
+                try:
+                    index = (
+                        self._build_index(project, previous_record)
+                        if previous_index_closed
+                        else previous_index
+                    )
+                except Exception:
+                    self._set_error(exc, generation)
+                    return
+                with self.lock:
+                    if generation == self._generation:
+                        self.record = previous_record
+                        self.index = index
+                        self.status = "ready"
+                        self.progress = None
+                        self.error = f"재분석 실패: {exc} 기존 분석 기록을 유지합니다."
+                        self.analysis_thread = None
+                return
+            self._set_error(exc, generation, keep_project=True)
+
+    def _build_index(self, project: Path, record: AnalysisRecord) -> Any:
+        from code_unit_viewer import UnitIndex, ViewerConfig
+
+        db_path = Path(str(record.path) + ".viewer.sqlite3")
+        config = ViewerConfig(record.path, db_path, project, "127.0.0.1", 0, False)
+        index = UnitIndex(config)
+        if not index.cache_is_current():
+            print(f"[index] building SQLite index from {record.path}", flush=True)
+            index.rebuild()
+        return index
+
+    def _install_record(
+        self, project: Path, record: AnalysisRecord, generation: int
+    ) -> None:
+        index = self._build_index(project, record)
+        with self.lock:
+            if generation != self._generation:
+                index.close()
+                return
+            old_index = self.index
+            self.project_root = project
+            self.record = record
+            self.index = index
+            self.status = "ready"
+            self.progress = None
+            self.error = None
+            self.analysis_thread = None
+        if old_index is not None and old_index is not index:
+            old_index.close()
+
+    def _set_error(
+        self, exc: Exception, generation: int, *, keep_project: bool = True
+    ) -> None:
+        print(f"[app] {type(exc).__name__}: {exc}", file=sys.stderr)
+        with self.lock:
+            if generation != self._generation:
+                return
+            self.status = "error"
+            self.error = str(exc)
+            self.progress = None
+            self.analysis_thread = None
+            if not keep_project:
+                self.project_root = None
+
+    def close(self) -> None:
+        with self.lock:
+            index = self.index
+            self.index = None
+        if index is not None:
+            index.close()
+
+
+def serve_application(
+    state: ViewerApplicationState,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    open_browser: bool = True,
+    project: Path | None = None,
+    force: bool = False,
+) -> int:
+    from code_unit_viewer import choose_port, make_handler
+
+    selected_port = choose_port(host, port)
+    server = ThreadingHTTPServer((host, selected_port), make_handler(state))
+    url = f"http://{host}:{selected_port}/"
+    print(f"[viewer] open {url}", flush=True)
+    if project is not None:
+        state.select_project(project, auto_analyze=True, force=force)
+    if open_browser:
+        threading.Timer(0.35, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[viewer] stopped", flush=True)
+    finally:
+        state.close()
+        server.server_close()
+    return 0
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -413,17 +543,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     if args.force and args.project is None:
         raise SystemExit("--force requires --project")
-    if args.project is not None:
-        try:
-            return run_project(args.project, force=args.force, open_browser=not args.no_browser)
-        except Exception as exc:
-            traceback.print_exc()
-            return 1
-
-    import tkinter as tk
-    from tkinter import filedialog, messagebox
-
-    return LauncherWindow(tk, filedialog, messagebox).run()
+    state = ViewerApplicationState()
+    try:
+        return serve_application(
+            state,
+            project=args.project,
+            force=args.force,
+            open_browser=not args.no_browser,
+        )
+    except Exception as exc:
+        print(f"[app] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

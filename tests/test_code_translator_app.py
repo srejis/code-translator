@@ -5,12 +5,16 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from code_translator_app import (
+    ViewerApplicationState,
+    choose_project_directory,
     find_analysis_record,
     project_cache_dir,
     project_json_path,
@@ -40,6 +44,26 @@ def write_record(path: Path, root: Path, *, unit_count: int = 0) -> None:
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def wait_for_status(state: ViewerApplicationState, expected: str, timeout: float = 5) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if state.app_payload()["status"] == expected:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"state did not become {expected}: {state.app_payload()}")
+
+
+def request_json(url: str, *, method: str = "GET", payload: dict | None = None):
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return response.status, json.loads(response.read().decode("utf-8"))
 
 
 class CacheTests(unittest.TestCase):
@@ -210,6 +234,140 @@ class CompatibilityAndFlowTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+                index.close()
+
+
+class DynamicApplicationTests(unittest.TestCase):
+    def make_state(self, base: Path, **kwargs) -> ViewerApplicationState:
+        return ViewerApplicationState(
+            output_root=base / "cache",
+            legacy_root=base / "legacy-none",
+            **kwargs,
+        )
+
+    def test_server_starts_empty_and_returns_clear_not_ready_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self.make_state(Path(temporary))
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                with urllib.request.urlopen(base_url + "/", timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIn("Code Unit Viewer", response.read().decode("utf-8"))
+                status, payload = request_json(base_url + "/api/app")
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["status"], "empty")
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    request_json(base_url + "/api/files")
+                self.assertEqual(caught.exception.code, 409)
+                error = json.loads(caught.exception.read().decode("utf-8"))
+                self.assertEqual(error["error"], "project_not_ready")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                state.close()
+
+    def test_select_without_record_becomes_project_selected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = base / "한글 프로젝트"
+            project.mkdir()
+            state = self.make_state(base)
+            state.select_project(str(project))
+            wait_for_status(state, "project_selected")
+            payload = state.app_payload()
+            self.assertEqual(payload["project"]["path"], str(project.resolve()))
+            self.assertFalse(payload["has_record"])
+            state.close()
+
+    def test_select_existing_record_becomes_ready_without_analysis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = base / "project"
+            project.mkdir()
+            record_path = project_json_path(project, output_root=base / "cache")
+            write_record(record_path, project, unit_count=9)
+
+            def forbidden_analyzer(*_args, **_kwargs):
+                raise AssertionError("existing record must not be analyzed")
+
+            state = self.make_state(base, analyzer=forbidden_analyzer)
+            state.select_project(project)
+            wait_for_status(state, "ready")
+            self.assertEqual(state.app_payload()["summary"]["unit_count"], 9)
+            self.assertIsNotNone(state.current_index())
+            state.close()
+
+    def test_invalid_project_path_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = self.make_state(Path(temporary))
+            with self.assertRaises(ValueError):
+                state.select_project(Path(temporary) / "missing")
+            self.assertEqual(state.app_payload()["status"], "empty")
+
+    def test_picker_is_injectable_and_cancel_is_supported(self):
+        self.assertEqual(choose_project_directory(lambda: "D:\\한글 프로젝트"), "D:\\한글 프로젝트")
+        self.assertIsNone(choose_project_directory(lambda: None))
+
+    def test_analysis_runs_in_background_reports_progress_and_rejects_duplicate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = base / "project"
+            project.mkdir()
+            started = threading.Event()
+            release = threading.Event()
+
+            def analyzer(root: Path, output_path: Path, **kwargs):
+                kwargs["progress_callback"](
+                    {"phase": "segmenting", "current": 1, "total": 2, "file": "sample.py"}
+                )
+                started.set()
+                release.wait(timeout=5)
+                write_record(output_path, root, unit_count=2)
+                return {}
+
+            state = self.make_state(base, analyzer=analyzer)
+            state.select_project(project)
+            wait_for_status(state, "project_selected")
+            state.start_analysis()
+            self.assertTrue(started.wait(timeout=5))
+            payload = state.app_payload()
+            self.assertEqual(payload["status"], "analyzing")
+            self.assertEqual(payload["progress"]["file"], "sample.py")
+            with self.assertRaises(RuntimeError):
+                state.start_analysis()
+            release.set()
+            wait_for_status(state, "ready")
+            record = state.record
+            self.assertIsNotNone(record)
+            self.assertTrue(Path(str(record.path) + ".viewer.sqlite3").exists())
+            state.close()
+
+    def test_failed_force_analysis_preserves_ready_record(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            project = base / "project"
+            project.mkdir()
+            destination = project_json_path(project, output_root=base / "cache")
+            write_record(destination, project, unit_count=4)
+            original = destination.read_bytes()
+
+            def failing_analyzer(_root: Path, _output_path: Path, **_kwargs):
+                raise RuntimeError("expected failure")
+
+            state = self.make_state(base, analyzer=failing_analyzer)
+            state.select_project(project)
+            wait_for_status(state, "ready")
+            state.start_analysis(force=True)
+            wait_for_status(state, "ready")
+            payload = state.app_payload()
+            self.assertIn("expected failure", payload["error"])
+            self.assertEqual(destination.read_bytes(), original)
+            self.assertEqual(payload["summary"]["unit_count"], 4)
+            state.close()
 
 
 if __name__ == "__main__":
