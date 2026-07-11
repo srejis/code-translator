@@ -19,7 +19,7 @@ class SegmentCodeRegressionTests(unittest.TestCase):
             )
             return result.units
 
-    def test_decorators_stay_with_definition(self):
+    def test_decorators_are_independent_units(self):
         units = self.segment_python(
             """@first
 @second(value=1)
@@ -28,61 +28,145 @@ def work(item):
 """
         )
 
+        decorators = [
+            unit
+            for unit in units
+            if unit.kind == "decorator"
+        ]
         definition = next(
             unit
             for unit in units
-            if "def work" in unit.code
+            if unit.node_type == "function_definition"
         )
-
-        self.assertIn("@first", definition.code)
-        self.assertIn("@second(value=1)", definition.code)
-        self.assertNotIn("run(item)", definition.code)
-        self.assertEqual(definition.kind, "definition")
-        self.assertEqual(definition.display_start_line, 1)
-        self.assertEqual(definition.display_end_line, 3)
-
-        self.assertFalse(
-            any(unit.node_type == "decorator" for unit in units)
-        )
-
         body = next(
             unit
             for unit in units
             if unit.code.strip() == "run(item)"
         )
+
+        self.assertEqual(
+            [unit.code.strip() for unit in decorators],
+            [
+                "@first",
+                "@second(value=1)",
+            ],
+        )
+        self.assertEqual(
+            definition.code.strip(),
+            "def work(item):",
+        )
+        self.assertNotIn("@first", definition.code)
+        self.assertNotIn("@second", definition.code)
+        self.assertNotIn("run(item)", definition.code)
+
+        self.assertEqual(definition.display_start_line, 3)
+        self.assertEqual(definition.display_end_line, 3)
+
+        self.assertEqual(
+            [unit.parent_id for unit in decorators],
+            [definition.parent_id, definition.parent_id],
+        )
+        self.assertEqual(
+            [unit.depth for unit in decorators],
+            [definition.depth, definition.depth],
+        )
         self.assertEqual(body.parent_id, definition.id)
 
-    def test_except_and_finally_are_independent_units(self):
+    def test_decorated_class_is_split(self):
+        units = self.segment_python(
+            """@frozen
+class Item:
+    value = 1
+"""
+        )
+
+        decorator = next(
+            unit
+            for unit in units
+            if unit.kind == "decorator"
+        )
+        definition = next(
+            unit
+            for unit in units
+            if unit.node_type == "class_definition"
+        )
+        member = next(
+            unit
+            for unit in units
+            if unit.code.strip() == "value = 1"
+        )
+
+        self.assertEqual(decorator.code.strip(), "@frozen")
+        self.assertEqual(definition.code.strip(), "class Item:")
+        self.assertNotIn("@frozen", definition.code)
+        self.assertNotIn("value = 1", definition.code)
+        self.assertEqual(member.parent_id, definition.id)
+
+    def test_except_else_and_finally_are_independent_units(self):
         units = self.segment_python(
             """try:
     run()
 except Exception as exc:
     handle(exc)
+else:
+    save()
 finally:
     close()
 """
         )
 
+        try_unit = next(
+            unit
+            for unit in units
+            if unit.node_type == "try_statement"
+        )
         except_unit = next(
             unit
             for unit in units
-            if unit.code.lstrip().startswith(
-                "except Exception as exc:"
-            )
+            if unit.node_type == "except_clause"
+        )
+        else_unit = next(
+            unit
+            for unit in units
+            if unit.node_type == "else_clause"
         )
         finally_unit = next(
             unit
             for unit in units
-            if unit.code.lstrip().startswith("finally:")
+            if unit.node_type == "finally_clause"
         )
 
-        self.assertNotIn("handle(exc)", except_unit.code)
-        self.assertNotIn("close()", finally_unit.code)
+        self.assertEqual(try_unit.code.strip(), "try:")
+        self.assertEqual(
+            except_unit.code.strip(),
+            "except Exception as exc:",
+        )
+        self.assertEqual(else_unit.code.strip(), "else:")
+        self.assertEqual(finally_unit.code.strip(), "finally:")
 
+        for unit in (
+            try_unit,
+            except_unit,
+            else_unit,
+            finally_unit,
+        ):
+            self.assertNotIn("...", unit.code)
+            self.assertNotIn("CLAUSE", unit.code)
+
+        run_unit = next(
+            unit
+            for unit in units
+            if unit.code.strip() == "run()"
+        )
         handle_unit = next(
             unit
             for unit in units
             if unit.code.strip() == "handle(exc)"
+        )
+        save_unit = next(
+            unit
+            for unit in units
+            if unit.code.strip() == "save()"
         )
         close_unit = next(
             unit
@@ -90,7 +174,9 @@ finally:
             if unit.code.strip() == "close()"
         )
 
+        self.assertEqual(run_unit.parent_id, try_unit.id)
         self.assertEqual(handle_unit.parent_id, except_unit.id)
+        self.assertEqual(save_unit.parent_id, else_unit.id)
         self.assertEqual(close_unit.parent_id, finally_unit.id)
 
     def test_multiline_data_assignment_remains_one_unit(self):
@@ -121,9 +207,15 @@ payload = {
         )
 
         self.assertIn('" reviews "', marker_unit.code)
+        self.assertIn('" review "', marker_unit.code)
         self.assertIn('" marks "', marker_unit.code)
+
         self.assertIn(
             '"original_language": original_language',
+            payload_unit.code,
+        )
+        self.assertIn(
+            '"original_prompt": original_prompt',
             payload_unit.code,
         )
         self.assertIn(
@@ -142,12 +234,13 @@ payload = {
 
         self.assertFalse(
             any(
-                unit.code.strip().rstrip(",") in isolated_values
+                unit.code.strip().rstrip(",")
+                in isolated_values
                 for unit in units
             )
         )
 
-    def test_complex_condition_splits_into_major_groups(self):
+    def test_complex_condition_remains_in_if_unit(self):
         units = self.segment_python(
             """for item in items:
     if (
@@ -178,15 +271,42 @@ payload = {
 """
         )
 
-        condition_groups = [
+        if_unit = next(
             unit
             for unit in units
-            if unit.scope_role.startswith("condition_group_")
-        ]
+            if unit.node_type == "if_statement"
+        )
+        continue_unit = next(
+            unit
+            for unit in units
+            if unit.code.strip() == "continue"
+        )
 
-        self.assertEqual(len(condition_groups), 2)
-        self.assertTrue(
-            all(unit.kind == "condition" for unit in condition_groups)
+        self.assertIn('"by phone" in flow_lower', if_unit.code)
+        self.assertIn(
+            'normalized_cleaned_lower.startswith("guests ")',
+            if_unit.code,
+        )
+        self.assertNotIn("CONDITION", if_unit.code)
+        self.assertNotIn("GROUP", if_unit.code)
+        self.assertNotIn("continue", if_unit.code)
+
+        self.assertFalse(
+            any(
+                unit.scope_role == "condition"
+                or unit.scope_role.startswith(
+                    "condition_group_"
+                )
+                for unit in units
+            )
+        )
+        self.assertEqual(continue_unit.parent_id, if_unit.id)
+
+    def test_simple_condition_remains_in_if_unit(self):
+        units = self.segment_python(
+            """if enabled and ready:
+    run()
+"""
         )
 
         if_unit = next(
@@ -194,24 +314,38 @@ payload = {
             for unit in units
             if unit.node_type == "if_statement"
         )
-        self.assertIn("CONDITION_GROUP_1", if_unit.code)
-        self.assertIn("CONDITION_GROUP_2", if_unit.code)
-        self.assertNotIn('"by phone"', if_unit.code)
+        run_unit = next(
+            unit
+            for unit in units
+            if unit.code.strip() == "run()"
+        )
 
-    def test_simple_condition_is_not_split(self):
+        self.assertEqual(
+            if_unit.code.strip(),
+            "if enabled and ready:",
+        )
+        self.assertEqual(run_unit.parent_id, if_unit.id)
+
+    def test_translation_code_has_no_synthetic_placeholders(self):
         units = self.segment_python(
-            """if enabled and ready:
-    run()
+            """@decorator
+def work(value):
+    if value:
+        return value
 """
         )
 
-        self.assertFalse(
-            any(
-                unit.scope_role == "condition"
-                or unit.scope_role.startswith("condition_group_")
-                for unit in units
-            )
+        forbidden = (
+            "...",
+            "BODY",
+            "MEMBERS",
+            "CONDITION",
+            "CLAUSE",
         )
+
+        for unit in units:
+            for token in forbidden:
+                self.assertNotIn(token, unit.code)
 
 
 if __name__ == "__main__":

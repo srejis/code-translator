@@ -54,7 +54,7 @@ python tools/segment_code.py . --output artifacts/code_units.json
   "node_type": "function_declaration",
   "start_line": 181,
   "end_line": 186,
-  "code": "function statusClassName(status: ReviewStatus | undefined) { /* BODY */ }",
+  "code": "function statusClassName(status: ReviewStatus | undefined) {}",
   "raw_code": "function statusClassName(...) { ... }"
 }
 ```
@@ -74,19 +74,25 @@ python tools/segment_code.py . --output artifacts/code_units.json
 현재 버전은 잘못 나누는 것보다 `large_unit` 경고로 남기는 쪽을 우선합니다.
 실제 `previbemap` 출력 JSON을 검토한 뒤 예외 규칙을 추가하는 방식이 적합합니다.
 
-## 2차 분리 규칙
+## 코드 번역 단위 규칙
 
-- 데코레이터는 바로 뒤 함수 또는 클래스 정의와 같은 단위에 포함한다.
-- 함수·클래스 정의 단위의 `code`에는 본문을 넣지 않는다.
-- `except`, `elif`, `else`, `finally`는 각각 독립 제어 단위로 만든다.
-- 각 절의 본문은 해당 절 단위의 자식으로 둔다.
+- 독립된 코드 문법 단위 하나를 자연어 문장 하나와 대응한다.
+- 코드의 목적, 기능, 역할을 추론하거나 요약하지 않는다.
+- 데코레이터는 각각 독립된 번역 단위로 만든다.
+- 함수와 클래스 정의는 데코레이터와 분리한다.
+- 함수·클래스 정의 단위의 `code`에는 정의 헤더만 넣는다.
+- 함수와 클래스 본문의 독립 문장은 정의 단위의 자식으로 저장한다.
+- `if`, `elif`, `else`, `for`, `while`, `try`, `except`, `finally`는 각각 독립된 제어문 헤더 단위로 만든다.
+- 제어문 조건식은 해당 제어문 단위에 포함하고 별도로 분리하지 않는다.
+- 조건이 길어도 글자 수나 의미 그룹을 기준으로 나누지 않는다.
 - 변수에 대입되는 리스트·딕셔너리·튜플·세트는 여러 줄이어도 전체 대입문 하나로 유지한다.
-- 데이터 내부 항목은 `member` 단위로 자동 분해하지 않는다.
-- 단순 조건은 제어문 헤더에 유지한다.
-- 복잡 조건은 AST의 최상위 논리 그룹을 기준으로 분리한다.
-- 긴 OR 체인처럼 명확한 상위 그룹이 없으면 각 비교식이 아니라 조건 전체를 자식 단위 하나로 둔다.
-- 글자 수는 조건식 복잡도 판단의 보조 기준이며 데이터 분리 기준으로 사용하지 않는다.
-- `display_start_line`과 `display_end_line`은 시각화 범위이고, `start_line`과 `end_line`은 원본 AST 전체 범위다.
+- 객체와 배열 리터럴 내부 항목은 독립 번역 단위로 자동 분해하지 않는다.
+- `parent_id`와 `depth`는 원본 중첩 위치를 보존하기 위한 메타데이터다.
+- 부모와 자식 번역문을 결합해 상위 기능을 만들지 않는다.
+- `code`에는 실제 번역할 코드만 저장하고 합성 자리표시자를 넣지 않는다.
+- `raw_code`에는 원본 AST 범위 전체를 보존한다.
+- `display_start_line`과 `display_end_line`은 시각화 범위다.
+- `start_line`과 `end_line`은 원본 AST 전체 범위다.
 
 ## 코드 단위 시각화
 

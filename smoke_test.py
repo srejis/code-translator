@@ -88,7 +88,7 @@ def main() -> None:
 
         # Multiline imports and function parameters stay one unit.
         assert any("import ReactFlow" in code and "Controls" in code for code in codes)
-        assert any("options = { active: true" in code and "/* BODY */" in code for code in codes)
+        assert any("options = { active: true" in code and ") {}" in code for code in codes)
 
         # Assigned multiline data stays one unit instead of becoming entries.
         assert any("const TEXT = {" in code and 'title: "제목"' in code for code in codes)
@@ -96,12 +96,13 @@ def main() -> None:
         assert not any(code.strip().rstrip(",") == 'title: "제목"' for code in codes)
 
         # Block callback is split; expression callback is not split.
-        assert any("items.map((item) => { /* BODY */ })" in code for code in codes)
+        assert any("items.map((item) => {})" in code for code in codes)
         assert any("<span key={row.id}>" in code for code in codes)
         assert not any(code.strip() == "<span key={row.id}>{row.label}</span>" for code in codes)
 
-        # Decorator + definition header stay together, body becomes children.
-        assert any("@router.get" in code and "async def read_item" in code and "..." in code for code in codes)
+        # Decorators are independent; definitions keep only their headers.
+        assert any(code.lstrip().startswith("@router.get") for code in codes)
+        assert any(code.lstrip().startswith("async def read_item") and "return await send" not in code for code in codes)
         assert any(unit["scope_role"] == "catch" for unit in units)
 
         print(f"smoke test passed: {len(units)} units")
