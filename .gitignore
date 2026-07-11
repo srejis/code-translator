@@ -1,1 +1,5 @@
 outputs/
+*.viewer.sqlite3
+*.viewer.sqlite3-shm
+*.viewer.sqlite3-wal
+*.viewer.sqlite3.tmp

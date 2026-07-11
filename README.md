@@ -73,3 +73,59 @@ python tools/segment_code.py . --output artifacts/code_units.json
 
 현재 버전은 잘못 나누는 것보다 `large_unit` 경고로 남기는 쪽을 우선합니다.
 실제 `previbemap` 출력 JSON을 검토한 뒤 예외 규칙을 추가하는 방식이 적합합니다.
+
+## 코드 단위 시각화
+
+`segment_code.py`가 생성한 대형 JSON을 IDE 형태로 검수하려면 로컬 뷰어를 실행합니다.
+
+### 분리 결과 생성
+
+```bat
+python segment_code.py D:\project\12_Gen_Code\codegraph-mvp ^
+  --output outputs\backend_unit.json ^
+  --batch-size 10
+```
+
+### 뷰어 실행
+
+```bat
+D:\anaconda3\envs\code_trans\python.exe code_unit_viewer.py outputs\backend_unit.json
+```
+
+또는:
+
+```bat
+run_viewer.bat outputs\backend_unit.json
+```
+
+JSON의 `root` 값이 현재 원본 저장소 위치와 다를 때만 `--root`를 사용합니다.
+
+```bat
+D:\anaconda3\envs\code_trans\python.exe code_unit_viewer.py outputs\backend_unit.json ^
+  --root D:\project\12_Gen_Code\codegraph-mvp
+```
+
+실행 후 브라우저에서 다음 기능을 사용할 수 있습니다.
+
+- 폴더별 파일 트리 펼치기
+- 파일명과 경로 검색
+- 경고 파일 및 파싱 오류 파일 필터링
+- 원본 코드 위의 번역 단위 시작선과 종료선 확인
+- 단위 클릭 후 `code`, `raw_code`, 부모·자식 관계 확인
+- 단위 목록 검색
+- 대형 JSON의 SQLite 색인 재사용
+
+첫 실행에서는 JSON 옆에 다음 캐시가 생성됩니다.
+
+```text
+backend_unit.json.viewer.sqlite3
+```
+
+JSON을 다시 생성한 경우 캐시는 자동으로 갱신됩니다. 강제로 다시 만들려면:
+
+```bat
+D:\anaconda3\envs\code_trans\python.exe code_unit_viewer.py outputs\backend_unit.json --rebuild-index
+```
+
+서버 종료는 실행 터미널에서 `Ctrl+C`입니다.
+
