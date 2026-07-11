@@ -90,10 +90,10 @@ def main() -> None:
         assert any("import ReactFlow" in code and "Controls" in code for code in codes)
         assert any("options = { active: true" in code and "/* BODY */" in code for code in codes)
 
-        # Assigned multiline data becomes parent + child entries.
-        assert any("const TEXT = { /* DATA */ }" in code for code in codes)
-        assert any('title: "제목"' in code for code in codes)
-        assert any("CONFIG = {...}" in code for code in codes)
+        # Assigned multiline data stays one unit instead of becoming entries.
+        assert any("const TEXT = {" in code and 'title: "제목"' in code for code in codes)
+        assert any("CONFIG = {" in code and '"body": "본문"' in code for code in codes)
+        assert not any(code.strip().rstrip(",") == 'title: "제목"' for code in codes)
 
         # Block callback is split; expression callback is not split.
         assert any("items.map((item) => { /* BODY */ })" in code for code in codes)

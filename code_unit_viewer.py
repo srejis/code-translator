@@ -41,7 +41,7 @@ except ImportError as exc:  # pragma: no cover
     ) from exc
 
 
-VIEWER_VERSION = 1
+VIEWER_VERSION = 2
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_SOURCE_BYTES = 30 * 1024 * 1024
@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS units (
     depth INTEGER NOT NULL,
     start_line INTEGER NOT NULL,
     end_line INTEGER NOT NULL,
+    display_start_line INTEGER NOT NULL,
+    display_end_line INTEGER NOT NULL,
     start_column INTEGER NOT NULL,
     end_column INTEGER NOT NULL,
     code TEXT NOT NULL,
@@ -173,10 +175,14 @@ class UnitIndex:
         unit_insert = """
             INSERT INTO units(
                 id, parent_id, file_path, ordinal, language, node_type, kind,
-                scope_role, depth, start_line, end_line, start_column,
-                end_column, code, raw_code, source_hash, warnings_json,
-                warning_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                scope_role, depth, start_line, end_line,
+                display_start_line, display_end_line,
+                start_column, end_column, code, raw_code, source_hash,
+                warnings_json, warning_count
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
         """
 
         indexed_files = 0
@@ -204,6 +210,17 @@ class UnitIndex:
                 unit_rows = []
                 for ordinal, unit in enumerate(units):
                     warnings = unit.get("warnings") or []
+                    start_line = int(unit.get("start_line", 1) or 1)
+                    end_line = int(unit.get("end_line", 1) or 1)
+                    display_start_line = int(
+                        unit.get("display_start_line", start_line)
+                        or start_line
+                    )
+                    display_end_line = int(
+                        unit.get("display_end_line", end_line)
+                        or end_line
+                    )
+
                     unit_rows.append(
                         (
                             str(unit.get("id", "")),
@@ -215,8 +232,10 @@ class UnitIndex:
                             str(unit.get("kind", "statement")),
                             str(unit.get("scope_role", "")),
                             int(unit.get("depth", 0) or 0),
-                            int(unit.get("start_line", 1) or 1),
-                            int(unit.get("end_line", 1) or 1),
+                            start_line,
+                            end_line,
+                            display_start_line,
+                            display_end_line,
                             int(unit.get("start_column", 0) or 0),
                             int(unit.get("end_column", 0) or 0),
                             str(unit.get("code", "")),
@@ -299,7 +318,9 @@ class UnitIndex:
         marker_rows = conn.execute(
             """
             SELECT id, parent_id, ordinal, node_type, kind, scope_role, depth,
-                   start_line, end_line, start_column, end_column, warning_count
+                   start_line, end_line,
+                   display_start_line, display_end_line,
+                   start_column, end_column, warning_count
             FROM units
             WHERE file_path = ?
             ORDER BY ordinal
@@ -329,8 +350,10 @@ class UnitIndex:
         data["warnings"] = json.loads(data.pop("warnings_json"))
         children = conn.execute(
             """
-            SELECT id, ordinal, node_type, kind, start_line, end_line, depth,
-                   warning_count
+            SELECT id, ordinal, node_type, kind,
+                   start_line, end_line,
+                   display_start_line, display_end_line,
+                   depth, warning_count
             FROM units
             WHERE parent_id = ?
             ORDER BY ordinal
@@ -887,8 +910,14 @@ INDEX_HTML = r'''<main id="app">
       state.sourceLines = data.source_available ? data.source.split(/\r?\n/) : [];
       state.markers = data.markers || [];
       state.markerById = new Map(state.markers.map((marker) => [marker.id, marker]));
-      state.starts = groupMarkers(state.markers, 'start_line');
-      state.ends = groupMarkers(state.markers, 'end_line');
+      state.starts = groupMarkers(
+        state.markers,
+        'display_start_line',
+      );
+      state.ends = groupMarkers(
+        state.markers,
+        'display_end_line',
+      );
       $('fileMeta').textContent = ` · ${data.language} · ${formatNumber(data.unit_count)} units${data.warning_count ? ` · ${data.warning_count} warnings` : ''}${data.parse_has_error ? ' · parse error' : ''}`;
       showNotice(data);
       renderUnitList();
@@ -961,7 +990,9 @@ INDEX_HTML = r'''<main id="app">
         button.type = 'button';
         button.className = 'marker' + (marker.warning_count ? ' warning' : '');
         button.textContent = marker.kind.slice(0, 3);
-        button.title = `${marker.id}\n${marker.kind} · ${marker.start_line}-${marker.end_line}`;
+        button.title = `${marker.id}
+${marker.kind} · display ${marker.display_start_line}-${marker.display_end_line}
+source ${marker.start_line}-${marker.end_line}`;
         button.addEventListener('click', (event) => {
           event.stopPropagation();
           selectUnit(marker.id, true);
@@ -984,9 +1015,23 @@ INDEX_HTML = r'''<main id="app">
       code.className = 'code-text';
       code.textContent = state.sourceLines[index] || '';
       row.addEventListener('click', () => {
-        const candidates = starts.length ? starts : state.markers.filter((marker) => marker.start_line <= lineNumber && marker.end_line >= lineNumber);
+        const candidates = starts.length
+          ? starts
+          : state.markers.filter(
+              (marker) =>
+                marker.display_start_line <= lineNumber
+                && marker.display_end_line >= lineNumber,
+            );
         if (candidates.length) {
-          const best = [...candidates].sort((a, b) => b.depth - a.depth || (a.end_line - a.start_line) - (b.end_line - b.start_line))[0];
+          const best = [...candidates].sort(
+            (a, b) =>
+              b.depth - a.depth
+              || (
+                a.display_end_line - a.display_start_line
+              ) - (
+                b.display_end_line - b.display_start_line
+              ),
+          )[0];
           selectUnit(best.id, false);
         }
       });
@@ -1036,7 +1081,7 @@ INDEX_HTML = r'''<main id="app">
       button.dataset.id = marker.id;
       button.style.top = `${index * state.unitRowHeight}px`;
       button.innerHTML = `
-        <span>${marker.start_line}-${marker.end_line}</span>
+        <span>${marker.display_start_line}-${marker.display_end_line}</span>
         <span class="badge">${esc(marker.kind)}</span>
         <span style="padding-left:${Math.min(marker.depth, 8) * 10}px">${esc(marker.node_type)}</span>
         <span>${marker.warning_count ? '<span class="warning-dot">warning</span>' : `d${marker.depth}`}</span>
@@ -1060,9 +1105,15 @@ INDEX_HTML = r'''<main id="app">
     const marker = state.markerById.get(unitId);
     if (!marker) return;
     state.selectedUnitId = unitId;
-    state.selectedRange = [marker.start_line, marker.end_line];
+    state.selectedRange = [
+      marker.display_start_line,
+      marker.display_end_line,
+    ];
     if (scrollToLine && state.fileData?.source_available) {
-      codeViewport.scrollTop = Math.max(0, (marker.start_line - 2) * state.lineHeight);
+      codeViewport.scrollTop = Math.max(
+        0,
+        (marker.display_start_line - 2) * state.lineHeight,
+      );
     }
     renderVisibleLines();
     renderVisibleUnits();
@@ -1080,7 +1131,14 @@ INDEX_HTML = r'''<main id="app">
     $('unitInspector').classList.remove('hidden');
     $('unitId').textContent = unit.id;
     $('unitKind').textContent = unit.kind;
-    $('unitLines').textContent = `${unit.start_line}:${unit.start_column} → ${unit.end_line}:${unit.end_column}`;
+    const sourceRange = `${unit.start_line}:${unit.start_column} → ${unit.end_line}:${unit.end_column}`;
+    const displayRange = `${unit.display_start_line} → ${unit.display_end_line}`;
+
+    $('unitLines').textContent =
+      unit.start_line === unit.display_start_line
+      && unit.end_line === unit.display_end_line
+        ? sourceRange
+        : `${displayRange} · source ${sourceRange}`;
     $('unitNode').textContent = unit.node_type;
     $('unitDepth').textContent = String(unit.depth);
     $('unitParent').textContent = unit.parent_id || '-';
@@ -1102,7 +1160,9 @@ INDEX_HTML = r'''<main id="app">
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'child-button';
-        button.textContent = `${child.start_line}-${child.end_line} · ${child.kind} · ${child.id}`;
+        button.textContent =
+          `${child.display_start_line}-${child.display_end_line}`
+          + ` · ${child.kind} · ${child.id}`;
         button.addEventListener('click', () => selectUnit(child.id, true));
         childrenEl.appendChild(button);
       }

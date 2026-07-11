@@ -136,23 +136,33 @@ PY_STRUCTURAL_TYPES = {
     "case_clause",
 }
 
-# A multiline object/array directly owned by one of these nodes is treated as
-# a data body: parent statement + independently translated entries.
-TS_DATA_OWNER_FIELDS: dict[str, tuple[str, ...]] = {
-    "variable_declarator": ("value",),
-    "assignment_expression": ("right",),
-    "augmented_assignment_expression": ("right",),
-    "pair": ("value",),
-    "public_field_definition": ("value",),
-    "required_parameter": ("pattern",),
+PY_CLAUSE_ROLES: dict[str, str] = {
+    "elif_clause": "elif_clause",
+    "else_clause": "else_clause",
+    "except_clause": "except_clause",
+    "finally_clause": "finally_clause",
 }
 
-PY_DATA_OWNER_FIELDS: dict[str, tuple[str, ...]] = {
-    "assignment": ("right",),
-    "augmented_assignment": ("right",),
-    "named_expression": ("value",),
-    "pair": ("value",),
+PY_CLAUSE_PARENT_TYPES = {
+    "if_statement",
+    "for_statement",
+    "while_statement",
+    "try_statement",
 }
+
+PY_CONDITION_OWNER_TYPES = {
+    "if_statement",
+    "elif_clause",
+    "while_statement",
+}
+
+CONDITION_CHAR_THRESHOLD = 500
+CONDITION_LINE_THRESHOLD = 10
+CONDITION_LEAF_THRESHOLD = 8
+CONDITION_DEPTH_THRESHOLD = 3
+CONDITION_GROUP_MAX = 4
+CONDITION_GROUP_MIN_LEAVES = 3
+CONDITION_GROUP_MIN_CHARS = 180
 
 
 @dataclass(frozen=True)
@@ -174,6 +184,8 @@ class CodeUnit:
     depth: int
     start_line: int
     end_line: int
+    display_start_line: int
+    display_end_line: int
     start_column: int
     end_column: int
     code: str
@@ -282,9 +294,14 @@ class CodeSegmenter:
         scope_role: str,
     ) -> None:
         for child in scope.named_children:
-            # ERROR nodes are diagnostics, not translation units.
             if child.type == "ERROR" or child.is_missing:
                 continue
+
+            # 정상적인 Python AST에서는 decorator가 decorated_definition
+            # 내부에 포함된다. 독립 decorator 단위가 생성되는 것을 방지한다.
+            if self._language == "python" and child.type == "decorator":
+                continue
+
             self._emit_unit(
                 child,
                 parent_id=parent_id,
@@ -309,18 +326,27 @@ class CodeSegmenter:
         normalized = self._trim_outer_blank_lines(normalized)
 
         if not normalized.strip() or self._only_symbols(normalized):
-            # Named AST nodes should rarely land here, but this protects the
-            # LLM input from empty/symbol-only units.
             return
 
         unit_id = self._next_id(node)
         warnings: list[str] = []
+
         if len(normalized) > self.max_unit_chars:
             warnings.append(
                 f"large_unit:{len(normalized)}chars; inspect before LLM batching"
             )
+
         if "ERROR" in {child.type for child in node.named_children}:
             warnings.append("contains_parse_error")
+
+        display_start_line, display_end_line = self._display_line_range(
+            node,
+            detachments,
+        )
+
+        kind = self._classify_kind(node)
+        if scope_role == "condition" or scope_role.startswith("condition_group_"):
+            kind = "condition"
 
         unit = CodeUnit(
             id=unit_id,
@@ -328,11 +354,13 @@ class CodeSegmenter:
             file=self._file,
             language=self._language,
             node_type=node.type,
-            kind=self._classify_kind(node),
+            kind=kind,
             scope_role=scope_role,
             depth=depth,
             start_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
+            display_start_line=display_start_line,
+            display_end_line=display_end_line,
             start_column=node.start_point[1],
             end_column=node.end_point[1],
             code=normalized,
@@ -343,7 +371,8 @@ class CodeSegmenter:
         self._units.append(unit)
 
         for detachment in sorted(
-            detachments, key=lambda item: (item.node.start_byte, item.node.end_byte)
+            detachments,
+            key=lambda item: (item.node.start_byte, item.node.end_byte),
         ):
             body = detachment.node
             if body.type in SCOPE_TYPES:
@@ -407,7 +436,9 @@ class CodeSegmenter:
     def _direct_detachments(self, node: Node) -> list[tuple[Node, str]]:
         result: list[tuple[Node, str]] = []
         structural_types = (
-            PY_STRUCTURAL_TYPES if self._language == "python" else TS_STRUCTURAL_TYPES
+            PY_STRUCTURAL_TYPES
+            if self._language == "python"
+            else TS_STRUCTURAL_TYPES
         )
 
         if node.type in structural_types:
@@ -422,32 +453,40 @@ class CodeSegmenter:
                 "decorated_definition",
             }
 
-            # Expression-bodied arrows/lambdas remain inside their surrounding
-            # statement. Only a real block body becomes child statements.
             if node.type in callable_types:
-                candidate = node.child_by_field_name("body")
+                candidate = self._callable_body(node)
                 if candidate is not None and candidate.type in {
                     "block",
                     "statement_block",
+                    "class_body",
                 }:
-                    result.append((candidate, self._role_for_owner(node, candidate, "body")))
+                    result.append(
+                        (
+                            candidate,
+                            self._role_for_owner(node, candidate, "body"),
+                        )
+                    )
             else:
-                # Fields cover class/type bodies and most control-flow bodies.
                 for field_name, role in (
                     ("body", "body"),
                     ("consequence", "consequence"),
                 ):
                     candidate = node.child_by_field_name(field_name)
-                    if candidate is not None and self._is_detachable_body(candidate):
-                        result.append((candidate, self._role_for_owner(node, candidate, role)))
+                    if (
+                        candidate is not None
+                        and self._is_detachable_body(candidate)
+                    ):
+                        result.append(
+                            (
+                                candidate,
+                                self._role_for_owner(
+                                    node,
+                                    candidate,
+                                    role,
+                                ),
+                            )
+                        )
 
-            # Clauses such as else/catch/finally are kept in the parent's
-            # skeleton; only their own blocks are detached when traversal
-            # reaches those clause nodes.
-
-            # Some grammars expose bodies as direct named children without a
-            # stable field name. This fallback is intentionally restricted to
-            # known structural nodes.
             if not result and node.type not in callable_types:
                 for child in node.named_children:
                     if child.type in {
@@ -459,9 +498,17 @@ class CodeSegmenter:
                         "enum_body",
                         "switch_body",
                     }:
-                        result.append((child, self._role_for_owner(node, child, self._scope_role(child))))
+                        result.append(
+                            (
+                                child,
+                                self._role_for_owner(
+                                    node,
+                                    child,
+                                    self._scope_role(child),
+                                ),
+                            )
+                        )
 
-        # TypeScript type/interface/enum bodies can be exposed through value.
         if self._language != "python" and node.type in {
             "type_alias_declaration",
             "interface_declaration",
@@ -476,36 +523,191 @@ class CodeSegmenter:
                 }:
                     result.append((candidate, "members"))
 
-        result.extend(self._direct_data_detachments(node))
+        result.extend(self._direct_clause_detachments(node))
+        result.extend(self._direct_condition_detachments(node))
+
+        # 리스트·딕셔너리·객체·배열 대입은 더 이상 내부 항목으로
+        # 자동 분해하지 않는다. 전체 대입문이 LLM 입력 단위가 된다.
         return self._deduplicate_nodes(result)
 
-    def _direct_data_detachments(self, node: Node) -> list[tuple[Node, str]]:
-        owner_fields = (
-            PY_DATA_OWNER_FIELDS
-            if self._language == "python"
-            else TS_DATA_OWNER_FIELDS
-        )
-        field_names = owner_fields.get(node.type)
-        if not field_names:
+    def _callable_body(self, node: Node) -> Node | None:
+        target = node
+
+        if node.type == "decorated_definition":
+            target = (
+                node.child_by_field_name("definition")
+                or node.child_by_field_name("body")
+            )
+
+            definition_types = {
+                "function_definition",
+                "class_definition",
+            }
+
+            if target is None or target.type not in definition_types:
+                target = next(
+                    (
+                        child
+                        for child in reversed(node.named_children)
+                        if child.type in definition_types
+                    ),
+                    None,
+                )
+
+        if target is None:
+            return None
+
+        return target.child_by_field_name("body")
+
+    def _direct_clause_detachments(
+        self,
+        node: Node,
+    ) -> list[tuple[Node, str]]:
+        if self._language != "python":
             return []
 
-        containers = (
-            {"dictionary", "list", "set", "tuple"}
-            if self._language == "python"
-            else {"object", "array"}
-        )
+        if node.type not in PY_CLAUSE_PARENT_TYPES:
+            return []
+
         result: list[tuple[Node, str]] = []
-        for field_name in field_names:
-            candidate = node.child_by_field_name(field_name)
-            if (
-                candidate is not None
-                and candidate.type in containers
-                and self._is_multiline(candidate)
-            ):
-                role = "items" if candidate.type in {"array", "list", "set", "tuple"} else "data"
-                result.append((candidate, role))
+        for child in node.named_children:
+            role = PY_CLAUSE_ROLES.get(child.type)
+            if role is not None:
+                result.append((child, role))
+
         return result
 
+    def _direct_condition_detachments(
+        self,
+        node: Node,
+    ) -> list[tuple[Node, str]]:
+        if self._language != "python":
+            return []
+
+        if node.type not in PY_CONDITION_OWNER_TYPES:
+            return []
+
+        condition = node.child_by_field_name("condition")
+        if condition is None:
+            return []
+
+        if not self._condition_is_complex(condition):
+            return []
+
+        groups = self._top_level_condition_groups(condition)
+        if groups:
+            return [
+                (group, f"condition_group_{index}")
+                for index, group in enumerate(groups, start=1)
+            ]
+
+        # 긴 OR 체인처럼 의미 있는 괄호 그룹이 없는 조건은
+        # 각 비교식으로 쪼개지 않고 조건 전체를 자식 단위 하나로 둔다.
+        return [(condition, "condition")]
+
+    def _condition_is_complex(self, node: Node) -> bool:
+        text = self._text(node)
+        return any(
+            (
+                len(text) >= CONDITION_CHAR_THRESHOLD,
+                text.count("\n") + 1 >= CONDITION_LINE_THRESHOLD,
+                self._boolean_leaf_count(node) >= CONDITION_LEAF_THRESHOLD,
+                self._boolean_depth(node) >= CONDITION_DEPTH_THRESHOLD,
+            )
+        )
+
+    def _top_level_condition_groups(self, node: Node) -> list[Node]:
+        root = self._unwrap_parenthesized(node)
+        if root.type != "boolean_operator":
+            return []
+
+        operator = self._boolean_operator_name(root)
+        if operator is None:
+            return []
+
+        groups = self._flatten_boolean_operator(root, operator)
+        if not 2 <= len(groups) <= CONDITION_GROUP_MAX:
+            return []
+
+        significant_count = sum(
+            1
+            for group in groups
+            if (
+                self._boolean_leaf_count(group)
+                >= CONDITION_GROUP_MIN_LEAVES
+                or len(self._text(group))
+                >= CONDITION_GROUP_MIN_CHARS
+            )
+        )
+
+        if significant_count < 2:
+            return []
+
+        return groups
+
+    def _flatten_boolean_operator(
+        self,
+        node: Node,
+        operator: str,
+    ) -> list[Node]:
+        # 명시적으로 괄호로 묶인 표현식은 하나의 의미 그룹으로 유지한다.
+        if node.type == "parenthesized_expression":
+            return [node]
+
+        if (
+            node.type != "boolean_operator"
+            or self._boolean_operator_name(node) != operator
+        ):
+            return [node]
+
+        output: list[Node] = []
+        for child in node.named_children:
+            output.extend(
+                self._flatten_boolean_operator(child, operator)
+            )
+        return output
+
+    def _boolean_operator_name(self, node: Node) -> str | None:
+        if node.type != "boolean_operator":
+            return None
+
+        for child in node.children:
+            token = self._text(child).strip()
+            if token in {"and", "or"}:
+                return token
+
+        return None
+
+    def _boolean_leaf_count(self, node: Node) -> int:
+        current = self._unwrap_parenthesized(node)
+        if current.type != "boolean_operator":
+            return 1
+
+        return sum(
+            self._boolean_leaf_count(child)
+            for child in current.named_children
+        )
+
+    def _boolean_depth(self, node: Node) -> int:
+        current = self._unwrap_parenthesized(node)
+        if current.type != "boolean_operator":
+            return 0
+
+        child_depths = [
+            self._boolean_depth(child)
+            for child in current.named_children
+        ]
+        return 1 + max(child_depths, default=0)
+
+    @staticmethod
+    def _unwrap_parenthesized(node: Node) -> Node:
+        current = node
+        while (
+            current.type == "parenthesized_expression"
+            and len(current.named_children) == 1
+        ):
+            current = current.named_children[0]
+        return current
 
     @staticmethod
     def _role_for_owner(owner: Node, body: Node, default: str) -> str:
@@ -549,6 +751,15 @@ class CodeSegmenter:
 
     def _placeholder(self, node: Node, role: str) -> str:
         if self._language == "python":
+            if role == "condition":
+                return "(CONDITION)"
+
+            if role.startswith("condition_group_"):
+                return f"({role.upper()})"
+
+            if role.endswith("_clause"):
+                return f"# <{role.upper()}>"
+
             return {
                 "block": "...",
                 "dictionary": "{...}",
@@ -556,6 +767,12 @@ class CodeSegmenter:
                 "set": "{...}",
                 "tuple": "(...)",
             }.get(node.type, "...")
+
+        if role == "condition":
+            return "(CONDITION)"
+
+        if role.startswith("condition_group_"):
+            return f"({role.upper()})"
 
         return {
             "statement_block": "{ /* BODY */ }",
@@ -596,6 +813,47 @@ class CodeSegmenter:
             "tuple": "items",
         }.get(node.type, "body")
 
+    def _display_line_range(
+        self,
+        node: Node,
+        detachments: Sequence[Detachment],
+    ) -> tuple[int, int]:
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+
+        body_types = {
+            "block",
+            "statement_block",
+            "class_body",
+            "switch_body",
+        }
+
+        body_detachments = [
+            item
+            for item in detachments
+            if item.node.type in body_types
+        ]
+
+        if not body_detachments:
+            return start_line, end_line
+
+        body = min(
+            body_detachments,
+            key=lambda item: item.node.start_byte,
+        ).node
+
+        if self._language == "python":
+            if body.start_point[0] > node.start_point[0]:
+                header_end_line = body.start_point[0]
+            else:
+                header_end_line = start_line
+        else:
+            # JS/TS statement_block는 여는 중괄호 위치부터 시작하므로
+            # 해당 줄까지 정의 헤더로 표시한다.
+            header_end_line = body.start_point[0] + 1
+
+        return start_line, max(start_line, header_end_line)
+
     def _classify_kind(self, node: Node) -> str:
         if node.type in COMMENT_TYPES:
             return "comment"
@@ -613,6 +871,7 @@ class CodeSegmenter:
             "interface_declaration",
             "type_alias_declaration",
             "enum_declaration",
+            "decorated_definition",
         }:
             return "definition"
         if node.type in {"pair", "property_signature", "method_signature"}:
@@ -748,7 +1007,7 @@ def serialize_result(
         len(unit.warnings) for result in file_results for unit in result.units
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "root": root.resolve().as_posix(),
         "summary": {
             "file_count": len(file_results),
