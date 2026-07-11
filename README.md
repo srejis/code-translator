@@ -132,12 +132,6 @@ python segment_code.py D:\project\12_Gen_Code\codegraph-mvp ^
 D:\anaconda3\envs\code_trans\python.exe code_unit_viewer.py outputs\backend_unit.json
 ```
 
-또는:
-
-```bat
-run_viewer.bat outputs\backend_unit.json
-```
-
 JSON의 `root` 값이 현재 원본 저장소 위치와 다를 때만 `--root`를 사용합니다.
 
 ```bat
