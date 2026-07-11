@@ -17,7 +17,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 try:
     from tree_sitter import Language, Node, Parser
@@ -900,6 +900,57 @@ def serialize_result(
     }
 
 
+def analyze_repository(
+    root: Path,
+    output_path: Path,
+    *,
+    batch_size: int = 10,
+    max_unit_chars: int = 4000,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    """Analyze a repository and write the existing JSON format as UTF-8."""
+    root = root.resolve()
+    output_path = output_path.resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Input does not exist: {root}")
+    if not root.is_dir() and not root.is_file():
+        raise ValueError(f"Input is not a directory or file: {root}")
+    if batch_size < 1 or batch_size > 10:
+        raise ValueError("batch_size must be between 1 and 10")
+
+    relative_to = root if root.is_dir() else root.parent
+    files = sorted(discover_source_files(root))
+    if not files:
+        raise ValueError(f"No supported source files found: {root}")
+
+    segmenter = CodeSegmenter(max_unit_chars=max_unit_chars)
+    file_results: list[FileResult] = []
+    total = len(files)
+    for current, path in enumerate(files, start=1):
+        relative_file = path.relative_to(relative_to).as_posix()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "segmenting",
+                    "current": current,
+                    "total": total,
+                    "file": relative_file,
+                }
+            )
+        file_results.append(segmenter.segment_file(path, relative_to=relative_to))
+
+    payload = serialize_result(root, file_results, batch_size=batch_size)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if progress_callback is not None:
+        progress_callback(
+            {"phase": "complete", "current": total, "total": total, "file": ""}
+        )
+    return payload
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Split a repository into hierarchical one-to-one LLM translation units."
@@ -928,24 +979,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    root = args.input.resolve()
-    if not root.exists():
-        raise SystemExit(f"Input does not exist: {root}")
-    if args.batch_size < 1 or args.batch_size > 10:
-        raise SystemExit("--batch-size must be between 1 and 10")
-
-    relative_to = root if root.is_dir() else root.parent
-    segmenter = CodeSegmenter(max_unit_chars=args.max_unit_chars)
-    files = sorted(discover_source_files(root))
-    file_results = [
-        segmenter.segment_file(path, relative_to=relative_to) for path in files
-    ]
-
-    payload = serialize_result(root, file_results, batch_size=args.batch_size)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    try:
+        payload = analyze_repository(
+            args.input,
+            args.output,
+            batch_size=args.batch_size,
+            max_unit_chars=args.max_unit_chars,
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     summary = payload["summary"]
     print(

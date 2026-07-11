@@ -1,4 +1,6 @@
 outputs/
+__pycache__/
+*.py[cod]
 *.viewer.sqlite3
 *.viewer.sqlite3-shm
 *.viewer.sqlite3-wal

@@ -500,7 +500,7 @@ def choose_port(host: str, preferred: int) -> int:
             except OSError:
                 continue
             return port
-    raise SystemExit(f"No available port found from {preferred} to {preferred + 19}")
+    raise OSError(f"No available port found from {preferred} to {preferred + 19}")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -528,25 +528,33 @@ def resolve_source_root(json_path: Path, override: Path | None) -> Path:
     return json_path.parent.resolve()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
-    json_path = args.json_file.resolve()
+def serve_viewer(
+    json_path: Path,
+    *,
+    source_root: Path | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    open_browser: bool = True,
+    rebuild_index: bool = False,
+) -> int:
+    """Build or reuse the index, then serve the viewer until interrupted."""
+    json_path = json_path.resolve()
     if not json_path.exists():
-        raise SystemExit(f"JSON file does not exist: {json_path}")
+        raise FileNotFoundError(f"JSON file does not exist: {json_path}")
 
-    source_root = resolve_source_root(json_path, args.root)
+    source_root = resolve_source_root(json_path, source_root)
     db_path = json_path.with_suffix(json_path.suffix + ".viewer.sqlite3")
-    port = choose_port(args.host, args.port)
+    selected_port = choose_port(host, port)
     config = ViewerConfig(
         json_path=json_path,
         db_path=db_path,
         source_root=source_root,
-        host=args.host,
-        port=port,
-        open_browser=not args.no_browser,
+        host=host,
+        port=selected_port,
+        open_browser=open_browser,
     )
     index = UnitIndex(config)
-    if args.rebuild_index or not index.cache_is_current():
+    if rebuild_index or not index.cache_is_current():
         print(f"[index] building SQLite index from {json_path}", flush=True)
         index.rebuild()
     else:
@@ -565,6 +573,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         server.server_close()
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    try:
+        return serve_viewer(
+            args.json_file,
+            source_root=args.root,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_browser,
+            rebuild_index=args.rebuild_index,
+        )
+    except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 INDEX_HTML = r'''<main id="app">

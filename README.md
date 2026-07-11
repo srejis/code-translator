@@ -7,9 +7,9 @@ LLM 번역 전에 소스 코드를 **입력 1개 → 번역문 1개** 단위로 
 
 - 줄바꿈과 들여쓰기가 아니라 Tree-sitter AST로 문장 경계를 판별합니다.
 - 함수·클래스·조건문·반복문 등의 정의/헤더는 부모 단위 1개로 만듭니다.
-- 부모 본문은 자리표시자로 바꾸고, 본문의 각 문장을 자식 단위로 재귀 추출합니다.
+- 부모 단위의 `code`에는 헤더만 두고, 본문의 각 문장을 자식 단위로 재귀 추출합니다.
 - 여러 줄의 매개변수·호출 입력값·조건식·연산식은 상위 문장에 포함합니다.
-- 여러 줄 데이터가 변수 대입의 직접 값이면 부모 데이터 정의와 각 항목을 분리합니다.
+- 여러 줄 데이터가 변수 대입의 직접 값이면 전체 대입문을 한 단위로 유지합니다.
 - 호출 입력값으로 전달된 객체/배열은 여러 줄이어도 호출문 한 단위에 유지합니다.
 - import, export, 정의, 타입, 주석도 단위에 포함합니다.
 - 빈 줄과 특수기호만 있는 항목은 제외합니다.
@@ -27,21 +27,28 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## 실행
+## 기본 실행
 
-`segment_code.py`가 저장소 바깥에 있을 때:
+Windows에서 다음 파일을 실행합니다.
 
-```bash
-python segment_code.py C:\\path\\to\\previbemap \
-  --output previbemap_code_units.json \
-  --batch-size 10
+```bat
+run_code_translator.bat
 ```
 
-저장소 안에 둘 경우:
+실행 흐름은 다음과 같습니다.
 
-```bash
-python tools/segment_code.py . --output artifacts/code_units.json
+```text
+폴더 선택 → 기존 기록 로드 또는 새 분석 → 브라우저 시각화
 ```
+
+선택한 프로젝트의 기록은 소스 프로젝트 내부가 아니라 이 도구의
+`outputs/projects/<폴더명>-<경로 해시>/`에 저장됩니다. 같은 프로젝트를 다시
+선택하면 기존 기록을 즉시 사용합니다. 최신 소스로 다시 만들려면 런처의
+`기록 삭제 후 새로 분석` 버튼을 누릅니다. 새 분석이 실패해도 기존 정상 기록은
+보존됩니다.
+
+분석 진행 중에는 런처에 현재 파일과 진행 개수가 표시됩니다. 준비가 끝나면
+사용 가능한 로컬 포트에서 뷰어가 실행되고 기본 브라우저가 자동으로 열립니다.
 
 ## 주요 출력 필드
 
@@ -94,7 +101,20 @@ python tools/segment_code.py . --output artifacts/code_units.json
 - `display_start_line`과 `display_end_line`은 시각화 범위다.
 - `start_line`과 `end_line`은 원본 AST 전체 범위다.
 
-## 코드 단위 시각화
+## 고급 사용법
+
+자동 테스트나 디버깅에서는 프로젝트를 직접 지정할 수 있습니다.
+
+```bat
+D:\anaconda3\envs\code_trans\python.exe code_translator_app.py --project "D:\path\to\project"
+D:\anaconda3\envs\code_trans\python.exe code_translator_app.py --project "D:\path\to\project" --force
+D:\anaconda3\envs\code_trans\python.exe code_translator_app.py --project "D:\path\to\project" --no-browser
+```
+
+`--force`는 기존 기록을 안전하게 교체하고, `--no-browser`는 서버만 실행합니다.
+서버 종료는 실행 터미널에서 `Ctrl+C`입니다.
+
+### 분석기와 뷰어 개별 실행
 
 `segment_code.py`가 생성한 대형 JSON을 IDE 형태로 검수하려면 로컬 뷰어를 실행합니다.
 
