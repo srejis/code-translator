@@ -1,0 +1,75 @@
+# previbemap code segmenter
+
+LLM 번역 전에 소스 코드를 **입력 1개 → 번역문 1개** 단위로 자르는 Python 도구입니다.
+초기 기준 저장소는 `srejis/previbemap`입니다.
+
+## 현재 분리 원칙
+
+- 줄바꿈과 들여쓰기가 아니라 Tree-sitter AST로 문장 경계를 판별합니다.
+- 함수·클래스·조건문·반복문 등의 정의/헤더는 부모 단위 1개로 만듭니다.
+- 부모 본문은 자리표시자로 바꾸고, 본문의 각 문장을 자식 단위로 재귀 추출합니다.
+- 여러 줄의 매개변수·호출 입력값·조건식·연산식은 상위 문장에 포함합니다.
+- 여러 줄 데이터가 변수 대입의 직접 값이면 부모 데이터 정의와 각 항목을 분리합니다.
+- 호출 입력값으로 전달된 객체/배열은 여러 줄이어도 호출문 한 단위에 유지합니다.
+- import, export, 정의, 타입, 주석도 단위에 포함합니다.
+- 빈 줄과 특수기호만 있는 항목은 제외합니다.
+- 한 파일 안에서 최대 10개씩 LLM 입력 배치를 함께 생성합니다.
+
+## 설치
+
+```bash
+python -m venv .venv
+# Windows
+.venv\\Scripts\\activate
+# macOS / Linux
+# source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+## 실행
+
+`segment_code.py`가 저장소 바깥에 있을 때:
+
+```bash
+python segment_code.py C:\\path\\to\\previbemap \
+  --output previbemap_code_units.json \
+  --batch-size 10
+```
+
+저장소 안에 둘 경우:
+
+```bash
+python tools/segment_code.py . --output artifacts/code_units.json
+```
+
+## 주요 출력 필드
+
+```json
+{
+  "id": "unit_000001_ab12cd34",
+  "parent_id": null,
+  "file": "previbemap-landing/components/use/UseApp.tsx",
+  "language": "tsx",
+  "node_type": "function_declaration",
+  "start_line": 181,
+  "end_line": 186,
+  "code": "function statusClassName(status: ReviewStatus | undefined) { /* BODY */ }",
+  "raw_code": "function statusClassName(...) { ... }"
+}
+```
+
+- `code`: LLM에 보낼 본문 제거 버전
+- `raw_code`: 원본 범위
+- `parent_id`: 함수·클래스·데이터 구조 안의 자식 관계
+- `warnings`: 너무 큰 단위 등 수동 확인이 필요한 항목
+- `llm_batches`: 같은 파일 단위로 최대 10개씩 묶은 후속 입력
+
+## 의도적으로 아직 고정하지 않은 부분
+
+- TSX의 거대한 JSX 반환문을 JSX 태그별로 분리할지 여부
+- `switch case` 내부를 별도 가상 본문으로 더 세밀하게 자르는 규칙
+- 한 줄짜리 대형 데이터와 여러 줄짜리 소형 데이터의 분리 기준
+
+현재 버전은 잘못 나누는 것보다 `large_unit` 경고로 남기는 쪽을 우선합니다.
+실제 `previbemap` 출력 JSON을 검토한 뒤 예외 규칙을 추가하는 방식이 적합합니다.
